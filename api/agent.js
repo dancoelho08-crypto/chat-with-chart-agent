@@ -1,6 +1,6 @@
-// Agent endpoint
+// Agent endpoint with full agent loop
 // POST /api/agent with { message, fhir_token, patient_id, history? }
-// Runs an agent loop with Claude using FHIR tools, returns final answer.
+// Runs an iterative agent loop: calls Claude, executes any tools, repeats until done.
 
 import Anthropic from "@anthropic-ai/sdk";
 
@@ -8,8 +8,11 @@ const client = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY
 });
 
-// We need to know which tools exist. We'll fetch them from our registry at startup.
-// In a real production system we'd cache this; for now we fetch on each request.
+const MAX_ITERATIONS = 10;
+const MODEL = "claude-sonnet-4-5";
+const MAX_TOKENS = 2048;
+
+// Fetch the list of available tool definitions from our registry
 async function getToolDefinitions(baseUrl) {
   const response = await fetch(`${baseUrl}/api/tools`);
   if (!response.ok) {
@@ -19,7 +22,7 @@ async function getToolDefinitions(baseUrl) {
   return data.tools;
 }
 
-// Execute a tool by calling our own registry endpoint
+// Execute a tool by calling our registry endpoint
 async function executeTool(baseUrl, toolName, input, fhirToken) {
   const response = await fetch(`${baseUrl}/api/tools`, {
     method: "POST",
@@ -33,14 +36,13 @@ async function executeTool(baseUrl, toolName, input, fhirToken) {
 
   if (!response.ok) {
     const errorBody = await response.text();
-    throw new Error(`Tool execution failed: ${response.status} ${errorBody}`);
+    throw new Error(`Tool '${toolName}' failed: ${response.status} ${errorBody}`);
   }
 
   const data = await response.json();
   return data.result;
 }
 
-// Build the system prompt that tells Claude its role and context
 function buildSystemPrompt(patientId) {
   return `You are a clinical assistant helping a healthcare provider review a patient's chart.
 
@@ -53,7 +55,111 @@ Guidelines:
 - Be concise and clinically appropriate in your responses
 - When citing specific data (dates, values, medication names), use the exact information returned by tools
 - If you don't have enough information to answer fully, say so rather than speculating
-- For complex questions, you may need to call multiple tools to gather sufficient context`;
+- For complex questions, you may need to call multiple tools to gather sufficient context
+- Once you have enough information to answer, provide your answer directly rather than continuing to call tools`;
+}
+
+// Run the full agent loop
+async function runAgentLoop({ baseUrl, systemPrompt, toolDefinitions, messages, fhirToken }) {
+  // Track every iteration for debugging
+  const trace = [];
+  let conversationMessages = [...messages];
+
+  for (let iteration = 0; iteration < MAX_ITERATIONS; iteration++) {
+
+    // Call Claude with current conversation state
+    const claudeResponse = await client.messages.create({
+      model: MODEL,
+      max_tokens: MAX_TOKENS,
+      system: systemPrompt,
+      tools: toolDefinitions,
+      messages: conversationMessages
+    });
+
+    trace.push({
+      iteration: iteration,
+      stop_reason: claudeResponse.stop_reason,
+      content_types: claudeResponse.content.map(c => c.type),
+      usage: claudeResponse.usage
+    });
+
+    // CASE 1 — Claude is done, return the final answer
+    if (claudeResponse.stop_reason === "end_turn") {
+      const finalText = claudeResponse.content
+        .filter(b => b.type === "text")
+        .map(b => b.text)
+        .join("\n");
+
+      return {
+        answer: finalText,
+        trace: trace,
+        iterations_used: iteration + 1,
+        final_messages: conversationMessages
+      };
+    }
+
+    // CASE 2 — Claude wants to use tools
+    if (claudeResponse.stop_reason === "tool_use") {
+      // Add Claude's response (with tool_use blocks) to the conversation
+      conversationMessages.push({
+        role: "assistant",
+        content: claudeResponse.content
+      });
+
+      // Execute each tool call and collect results
+      const toolResultBlocks = [];
+      const toolUseBlocks = claudeResponse.content.filter(b => b.type === "tool_use");
+
+      for (const toolUse of toolUseBlocks) {
+        try {
+          const result = await executeTool(
+            baseUrl,
+            toolUse.name,
+            toolUse.input,
+            fhirToken
+          );
+
+          toolResultBlocks.push({
+            type: "tool_result",
+            tool_use_id: toolUse.id,
+            content: JSON.stringify(result)
+          });
+        } catch (error) {
+          // Tool failed — return the error to Claude so it can react
+          toolResultBlocks.push({
+            type: "tool_result",
+            tool_use_id: toolUse.id,
+            content: `Error executing tool: ${error.message}`,
+            is_error: true
+          });
+        }
+      }
+
+      // Add the tool results as a user message and loop again
+      conversationMessages.push({
+        role: "user",
+        content: toolResultBlocks
+      });
+
+      continue;
+    }
+
+    // CASE 3 — Unexpected stop reason
+    return {
+      answer: `[Agent stopped unexpectedly: ${claudeResponse.stop_reason}]`,
+      trace: trace,
+      iterations_used: iteration + 1,
+      error: `Unexpected stop_reason: ${claudeResponse.stop_reason}`
+    };
+  }
+
+  // CASE 4 — Hit the iteration cap without finishing
+  return {
+    answer: "[The agent reached its maximum number of iterations without producing a final answer. The question may require more research or a more focused query.]",
+    trace: trace,
+    iterations_used: MAX_ITERATIONS,
+    error: "Max iterations reached"
+  };
 }
 
 export default async function handler(req, res) {
@@ -73,7 +179,6 @@ export default async function handler(req, res) {
   try {
     const { message, fhir_token, patient_id, history = [] } = req.body;
 
-    // Validate inputs
     if (!message || typeof message !== "string") {
       return res.status(400).json({ error: "Missing 'message' field" });
     }
@@ -84,42 +189,32 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: "Missing 'patient_id' field" });
     }
 
-    // Figure out the base URL of this deployment (so we can call our own /api/tools)
     const protocol = req.headers["x-forwarded-proto"] || "https";
     const host = req.headers.host;
     const baseUrl = `${protocol}://${host}`;
 
-    // Load tool definitions from our registry
     const toolDefinitions = await getToolDefinitions(baseUrl);
 
-    // Build the messages array (history + new user message)
     const messages = [
       ...history,
       { role: "user", content: message }
     ];
 
-    // Build the system prompt
     const systemPrompt = buildSystemPrompt(patient_id);
 
-    // PHASE 1: Single Claude call, no loop yet
-    const claudeResponse = await client.messages.create({
-      model: "claude-sonnet-4-5",
-      max_tokens: 2048,
-      system: systemPrompt,
-      tools: toolDefinitions,
-      messages: messages
+    const result = await runAgentLoop({
+      baseUrl: baseUrl,
+      systemPrompt: systemPrompt,
+      toolDefinitions: toolDefinitions,
+      messages: messages,
+      fhirToken: fhir_token
     });
 
-    // For Phase 1, just return Claude's raw response so we can see what comes back
     return res.status(200).json({
-      stop_reason: claudeResponse.stop_reason,
-      content: claudeResponse.content,
-      usage: claudeResponse.usage,
-      // Echo back useful debug info
-      debug: {
-        tool_count: toolDefinitions.length,
-        message_count: messages.length
-      }
+      answer: result.answer,
+      iterations_used: result.iterations_used,
+      trace: result.trace,
+      error: result.error || null
     });
 
   } catch (error) {
